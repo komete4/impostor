@@ -126,9 +126,9 @@ When users share links, their content will be summarized in a "LINK SUMMARIES" s
 RESPONSE FORMAT:
 Answer with one JSON object and nothing else:
 {"needs_tool": false, "continue_iterating": false, "message": "what you say", "reply_to": null, "react": null}
-"message" is your normal NAME response: what you'd type, in your own voice, or "" to stay silent.
+"message" is your normal NAME response: what you'd type, in your own voice, or "" to stay silent.`;
 
-TOOLS:
+  static tool_prompt = `TOOLS:
 You can look something up before you answer. To do that, answer with "needs_tool": true, a "tool_request" and an empty "message"; you get the result back and answer again:
 {"needs_tool": true, "continue_iterating": false, "tool_request": {"tool_name": "web_search", "query": "the question", "reason": "why"}, "message": ""}
 - web_search ("query"): asks a search engine and returns an answer with sources. For things that happened recently, prices, scores, release dates, and facts someone wants right that you don't know cold. Usually enough on its own.
@@ -170,6 +170,7 @@ Set "continue_iterating": true only when you expect to need another tool call af
     reactMaxLength = 24,
     lullMinutes = 30,
     maxLinkSummaries = 5,
+    toolsEnabled = true,
   } = {}) {
     this.logger = logger;
     this.persona = persona;
@@ -180,6 +181,7 @@ Set "continue_iterating": true only when you expect to need another tool call af
     this.reactMaxLength = reactMaxLength;
     this.lullMinutes = lullMinutes;
     this.maxLinkSummaries = maxLinkSummaries;
+    this.toolsEnabled = toolsEnabled;
     try {
       // Fail at construction, not on the first message, if the zone is bad.
       new Intl.DateTimeFormat("en-US", { timeZone: timezone });
@@ -242,7 +244,9 @@ Set "continue_iterating": true only when you expect to need another tool call af
       .replaceAll("NAME", this.botName)
       .replaceAll("TIMEZONE", this.timezoneLabel())
       .replace("REACTION_STYLE", () => this.persona.reactions || ContextUtils.DEFAULT_REACTION_STYLE);
-    return `${this.persona.character}\n\n${medium}`;
+    const tools = this.toolsEnabled ? ContextUtils.tool_prompt
+      : 'Tools are disabled. Return your message with "needs_tool" and "continue_iterating" both false.';
+    return `${this.persona.character}\n\n${medium}\n\n${tools}`;
   }
 
   /**

@@ -13,7 +13,13 @@ const { SilenceDirector, NewsDesk } = require("./classes/spontaneity");
 const { WeatherDesk } = require("./classes/weather");
 const WebServer = require("./web/server");
 
-const logger = new Logger(true);
+const bots = listBots(config);
+const logger = new Logger(config.debug !== false, null, [
+  config.generator.deepseek.api_key,
+  config.web?.auth?.password,
+  ...Object.values(config.irc?.channel_keys || {}),
+  ...bots.flatMap((bot) => [bot.account?.password, ...Object.values(bot.irc?.channel_keys || {})]),
+]);
 const dataDir = path.join(__dirname, "data");
 
 // One model client and one set of tools for every bot. The SDK's defaults
@@ -31,8 +37,6 @@ const tools = {
   webSearchTool: new WebSearchTool(logger, config),
   webFetchTool: new WebFetchTool(logger),
 };
-
-const bots = listBots(config);
 
 // One director for every bot, so one of them at a time is offered a quiet
 // channel, and one news cache so they don't all run the same search.
@@ -85,7 +89,7 @@ if (config.web?.enabled) {
 }
 
 for (const client of clients.values()) {
-  client.connect();
+  if (client.config.irc.enabled !== false) client.connect();
 }
 director.start();
 

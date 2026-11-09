@@ -24,10 +24,14 @@ class WebServer {
   }
 
   setupMiddleware() {
-    this.app.use(express.json());
-
     // Basic auth for dashboard (skip for health endpoint)
     const authConfig = this.config.web?.auth;
+    if (this.config.web?.require_auth && (
+      typeof authConfig?.username !== "string" || !authConfig.username.trim() ||
+      typeof authConfig?.password !== "string" || !authConfig.password.trim()
+    )) {
+      throw new Error("web.require_auth requires web.auth username and password");
+    }
     if (authConfig?.username && authConfig?.password) {
       this.app.use((req, res, next) => {
         if (req.path === "/health") return next();
@@ -47,6 +51,16 @@ class WebServer {
         res.setHeader("WWW-Authenticate", 'Basic realm="Impostor Dashboard"');
         return res.status(401).send("Invalid credentials");
       });
+    }
+
+    if (this.config.web?.read_only) {
+      this.app.use((req, res, next) => {
+        if (req.method === "GET" || req.method === "HEAD") return next();
+        res.setHeader("Allow", "GET, HEAD");
+        return res.sendStatus(405);
+      });
+    } else {
+      this.app.use(express.json());
     }
 
     // Serve static files

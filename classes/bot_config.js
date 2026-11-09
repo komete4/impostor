@@ -57,6 +57,15 @@ function listBots(config) {
         throw new Error(`Bot "${bot.id}": "${key}" must be a list of strings`);
       }
     }
+    const channelKeys = bot.irc?.channel_keys ?? config.irc?.channel_keys;
+    if (channelKeys !== undefined && (
+      !channelKeys || typeof channelKeys !== "object" || Array.isArray(channelKeys) ||
+      Object.entries(channelKeys).some(([channel, key]) =>
+        !bot.channels?.includes(channel) || typeof key !== "string" || !key || /[\u0000-\u0020,:]/.test(key)
+      )
+    )) {
+      throw new Error(`Bot "${bot.id}": irc.channel_keys must map configured channels to valid IRC keys`);
+    }
     const id = bot.id.toLowerCase();
     const nick = bot.nick.toLowerCase();
     if (ids.has(id)) throw new Error(`Two bots share the id "${bot.id}"`);

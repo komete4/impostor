@@ -27,6 +27,7 @@ const { WeatherDesk } = require("./weather");
 class ImpostorClient {
   /** A multiline piece stays under this many UTF-8 bytes so the relayed line fits in 512. */
   static MULTILINE_PIECE_BYTES = 400;
+  static CLOSED_CHANNEL_MODES = "Psnk";
 
   /**
    * @param {Object} logger - A logger tagged with this bot's id
@@ -56,6 +57,7 @@ class ImpostorClient {
       reactMaxLength: config.irc.reaction_max_length ?? 24,
       lullMinutes: config.context?.lull_minutes ?? 30,
       maxLinkSummaries: config.context?.max_link_summaries ?? 5,
+      toolsEnabled: config.tools?.enabled !== false,
     });
     this.config = config;
     this.logger = logger;
@@ -63,6 +65,7 @@ class ImpostorClient {
     // IRC client
     this.ircClient = new IRC.Client();
     this.botNick = config.irc.nick;
+    this.closedChannelChecks = new Map();
 
     this.openai = openai;
 
@@ -183,6 +186,7 @@ class ImpostorClient {
     // IRC event handlers
     this.ircClient.on("registered", () => {
       this.reconnectDelay = 1000;
+      this.closedChannelChecks.clear();
       this.logger.info(`Connected to IRC as ${this.botNick}!`);
       this.botModeSet = false;
       // A fresh connection has no away status; put ours back.
@@ -190,7 +194,7 @@ class ImpostorClient {
       this.sendMetadata();
       // Join configured channels
       for (const channel of config.irc.channels) {
-        this.ircClient.join(channel);
+        this.ircClient.join(channel, config.irc.channel_keys?.[channel]);
         this.logger.info(`Joining ${channel}`);
       }
     });
@@ -199,6 +203,10 @@ class ImpostorClient {
       this.roster.join(event.nick, event.channel);
       if (event.nick.toLowerCase() === this.botNick.toLowerCase()) {
         this.logger.info(`Joined ${event.channel}`);
+        if (this.requiresClosedChannel(event.channel)) {
+          this.closedChannelChecks.set(event.channel.toLowerCase(), { member: false, modes: false });
+          this.ircClient.raw("MODE", event.channel);
+        }
         // NAMES says who is here; WHO says who of them is away, and which are bots.
         this.ircClient.who(event.channel, (who) => this.roster.setWho(who?.users));
       } else {
@@ -209,16 +217,43 @@ class ImpostorClient {
 
     this.ircClient.on("userlist", (event) => {
       this.roster.setUserlist(event.channel, event.users);
+      const check = this.closedChannelChecks.get(event.channel.toLowerCase());
+      if (!check) return;
+      const self = event.users.find((user) => user.nick.toLowerCase() === this.botNick.toLowerCase());
+      if (!self || self.modes.length !== 0) return this.leaveUnsafeChannel(event.channel);
+      check.member = true;
+    });
+
+    this.ircClient.on("channel info", (event) => {
+      const check = this.closedChannelChecks.get(event.channel.toLowerCase());
+      if (!check || !event.modes) return;
+      if (![...ImpostorClient.CLOSED_CHANNEL_MODES].every((required) =>
+        event.modes.some(({ mode }) => mode === `+${required}`))) {
+        return this.leaveUnsafeChannel(event.channel);
+      }
+      check.modes = true;
+    });
+
+    this.ircClient.on("mode", (event) => {
+      if (!this.closedChannelChecks.has(event.target.toLowerCase())) return;
+      if (event.modes.some(({ mode, param }) =>
+        (mode[0] === "-" && ImpostorClient.CLOSED_CHANNEL_MODES.includes(mode[1])) ||
+        (/^\+[qaohv]$/.test(mode) && param?.toLowerCase() === this.botNick.toLowerCase())
+      )) this.leaveUnsafeChannel(event.target);
     });
 
     this.ircClient.on("part", (event) => {
-      if (event.nick.toLowerCase() === this.botNick.toLowerCase()) this.roster.forget(event.channel);
-      else this.roster.leave(event.nick, event.channel);
+      if (event.nick.toLowerCase() === this.botNick.toLowerCase()) {
+        this.closedChannelChecks.delete(event.channel.toLowerCase());
+        this.roster.forget(event.channel);
+      } else this.roster.leave(event.nick, event.channel);
     });
 
     this.ircClient.on("kick", (event) => {
-      if (event.kicked.toLowerCase() === this.botNick.toLowerCase()) this.roster.forget(event.channel);
-      else this.roster.leave(event.kicked, event.channel);
+      if (event.kicked.toLowerCase() === this.botNick.toLowerCase()) {
+        this.closedChannelChecks.delete(event.channel.toLowerCase());
+        this.roster.forget(event.channel);
+      } else this.roster.leave(event.kicked, event.channel);
     });
 
     this.ircClient.on("quit", (event) => {
@@ -269,6 +304,7 @@ class ImpostorClient {
     });
 
     this.ircClient.on("close", () => {
+      this.closedChannelChecks.clear();
       this.logger.info("IRC connection closed");
       this._scheduleReconnect();
     });
@@ -322,6 +358,7 @@ class ImpostorClient {
       host: ircConfig.host,
       port: ircConfig.port || 6697,
       tls: ircConfig.tls !== false,
+      rejectUnauthorized: true,
       nick: ircConfig.nick,
       username: ircConfig.username || ircConfig.nick.toLowerCase(),
       gecos: ircConfig.realname || ircConfig.nick,
@@ -410,20 +447,36 @@ class ImpostorClient {
    */
   isAllowedChannel(channel) {
     const channels = this.config.irc.channels;
-    if (!channels || channels.length === 0) return true;
-    return channels.some((c) => c.toLowerCase() === channel.toLowerCase());
+    if (!channels || channels.length === 0) return !this.config.irc.mentions_only;
+    if (!channels.some((c) => c.toLowerCase() === channel.toLowerCase())) return false;
+    if (!this.requiresClosedChannel(channel)) return true;
+    const check = this.closedChannelChecks.get(channel.toLowerCase());
+    return Boolean(check?.member && check.modes);
+  }
+
+  requiresClosedChannel(channel) {
+    return this.config.irc.mentions_only && Object.keys(this.config.irc.channel_keys || {})
+      .some((name) => name.toLowerCase() === channel.toLowerCase());
+  }
+
+  leaveUnsafeChannel(channel) {
+    this.closedChannelChecks.delete(channel.toLowerCase());
+    this.logger.warn(`Leaving ${channel}: required closed channel or ordinary membership checks failed`);
+    this.ircClient.part(channel);
   }
 
   /**
    * Whether the bot should respond to a private message from this nick.
-   * Default-deny: if irc.pm_allowed_users is unset or empty, we accept and
-   * store DMs (so the dashboard sees them) but never reply. Otherwise only
-   * the listed nicks get replies.
+   * An unset or empty irc.pm_allowed_users permits no replies.
    */
   isAllowedPmSender(nick) {
     const allowed = this.config.irc.pm_allowed_users;
     if (!allowed || allowed.length === 0) return false;
     return allowed.some((n) => n.toLowerCase() === nick.toLowerCase());
+  }
+
+  shouldDropPm(nick) {
+    return this.config.irc.drop_disallowed_dms && !this.isAllowedPmSender(nick);
   }
 
   /**
@@ -445,13 +498,18 @@ class ImpostorClient {
     const isPrivate = !event.target.startsWith("#");
     const conversationId = isPrivate ? event.nick : event.target;
 
-    if (!isPrivate && !this.isAllowedChannel(event.target)) return;
+    if (isPrivate ? this.shouldDropPm(event.nick) : !this.isAllowedChannel(event.target)) return;
 
     // A relay bot is opt-in: without irc.bridge_nick nothing is unwrapped
     // and nothing is treated as an announcement.
     const bridgeNick = this.config.irc.bridge_nick || null;
     const { nick, message: messageText, isWebhookAnnouncement } =
       parseBridgedMessage(event.nick, event.message, bridgeNick, this.config.irc.bridge_tags);
+
+    const replyMsgid = event.tags?.["+draft/reply"];
+    const replyTarget = replyMsgid ? this.db.getMessageByMsgid(replyMsgid) : null;
+    const addressed = !isPrivate && (replyTarget?.is_bot_message || this.mentionsBot(messageText));
+    if (!isPrivate && this.config.irc.mentions_only && !addressed) return;
 
     const message = createIrcMessage(nick, conversationId, messageText, {
       ident: event.ident,
@@ -467,13 +525,9 @@ class ImpostorClient {
 
     // A reply (+draft/reply) to a line we know is threaded onto it, and a
     // reply to one of his own lines is as good as using his name.
-    const replyMsgid = event.tags?.["+draft/reply"];
-    const replyTarget = replyMsgid ? this.db.getMessageByMsgid(replyMsgid) : null;
     if (replyTarget) message.reference = { messageId: replyTarget.id };
-    const repliesToBot = Boolean(replyTarget?.is_bot_message);
 
-    // Always track the message so the admin dashboard surfaces every chat,
-    // including DMs from non-allowlisted senders.
+    // Track the message after the configured admission checks.
     await this.messageTracker.addMessage(message, {
       isBotMessage: false,
       processVision: true,
@@ -506,10 +560,8 @@ class ImpostorClient {
 
     this.archivist.noteActivity(conversationId);
 
-    // Channel: route every message through the evaluator. Direct mentions
-    // used to short-circuit straight to a response, but that bypassed the
-    // react/ignore branches — now the evaluator decides for everything.
-    const addressed = repliesToBot || this.mentionsBot(messageText);
+    // In mentions-only mode a direct address is the only admitted channel line.
+    // Otherwise, let the evaluator decide whether to answer any channel line.
     if (addressed) this.presence.noteAddressed();
 
     // Gone (asleep, in class): the line is stored and the journal will
@@ -519,7 +571,10 @@ class ImpostorClient {
       return;
     }
 
-    if (this.config.autonomous?.enabled) {
+    if (this.config.irc.mentions_only) {
+      this.messageQueue.push({ message, channel: conversationId, type: "direct" });
+      if (!this.isProcessing) this.processMessageQueue();
+    } else if (this.config.autonomous?.enabled) {
       this.scheduleAutonomousEvaluation(conversationId, { addressed });
     }
   }
@@ -537,6 +592,9 @@ class ImpostorClient {
     // Our own come back as echoes; his reactions are stored when he sends them.
     if (event.nick.toLowerCase() === this.botNick.toLowerCase()) return;
 
+    const isPrivate = !event.target.startsWith("#");
+    if (isPrivate ? this.shouldDropPm(event.nick) : !this.isAllowedChannel(event.target)) return;
+
     const tags = event.tags || {};
     if (tags["+typing"] && event.target.startsWith("#")) {
       this.roster.noteTyping(event.target, event.nick, tags["+typing"]);
@@ -544,11 +602,9 @@ class ImpostorClient {
     const targetMsgid = tags["+draft/reply"];
     const react = tags["+draft/react"];
     const unreact = tags["+draft/unreact"];
-    if (!targetMsgid || (!react && !unreact)) return;
+    if (!targetMsgid || (!react && !unreact) || this.config.irc.reactions === false) return;
 
-    const isPrivate = !event.target.startsWith("#");
     const conversationId = isPrivate ? event.nick : event.target;
-    if (!isPrivate && !this.isAllowedChannel(event.target)) return;
 
     const authorId = ircUserId(event.nick, event.ident, event.hostname);
     if (react) {
@@ -915,6 +971,10 @@ class ImpostorClient {
    */
   mentionsBot(text) {
     const content = (text || "").toLowerCase();
+    if (this.config.irc.mentions_only) {
+      const nicks = content.split(/[^\p{L}\p{N}\[\]{}\\|`_^~-]+/u);
+      return nicks.includes(this.botNick.toLowerCase());
+    }
     return [this.watchword, this.botNick]
       .filter(Boolean)
       .some((n) => content.includes(n.toLowerCase()));
@@ -1092,6 +1152,7 @@ class ImpostorClient {
     const maxDelay = Math.max(minDelay, this.config.irc.dm_delay_max_seconds ?? 6);
     const delay = minDelay + Math.random() * (maxDelay - minDelay);
     if (delay > 0) await new Promise((r) => setTimeout(r, delay * 1000));
+    if (this.requiresClosedChannel(channelName) && !this.isAllowedChannel(channelName)) return;
 
     const { dbMessages, imageDescriptions, memory } = this.buildContextFromDatabase(channelName);
 
@@ -1122,6 +1183,7 @@ class ImpostorClient {
       this.stopTyping(channelName, "done");
       throw err;
     }
+    if (this.requiresClosedChannel(channelName) && !this.isAllowedChannel(channelName)) return;
 
     // An empty response is the model's "stay silent" signal. Skip the IRC send
     // and chatlog tracking (an empty bot line would pollute future context),
@@ -1535,6 +1597,7 @@ class ImpostorClient {
     let allToolResults = [];
 
     while (
+      this.config.tools?.enabled !== false &&
       structuredResponse.needs_tool &&
       structuredResponse.tool_request &&
       iterationCount < maxIterations
@@ -1739,6 +1802,9 @@ Reply with valid JSON in the format described above.`,
   }
 
   async executeTool(toolRequest) {
+    if (this.config.tools?.enabled === false) {
+      return { success: false, output: "", error: "Tools are disabled" };
+    }
     this.logger.info(
       `Executing ${toolRequest.tool_name} tool:`,
       toolRequest.reason
@@ -2042,6 +2108,7 @@ Reply with valid JSON in the format described above.`,
    * @param {Object} occurrence - The schedule occurrence being entered
    */
   async sayGoodbyes(occurrence) {
+    if (this.config.irc.mentions_only) return;
     const windowMinutes = this.config.presence?.goodbye_window_minutes ?? 10;
     const since = this.presence.clock().getTime() - windowMinutes * 60000;
     for (const channel of this.config.irc.channels || []) {
@@ -2114,7 +2181,7 @@ Reply with valid JSON in the format described above.`,
         };
         this.messageQueue.push({ message, channel: conversationId, type: "direct" });
         if (!this.isProcessing) this.processMessageQueue();
-      } else if (this.config.autonomous?.enabled) {
+      } else if (this.config.autonomous?.enabled && !this.config.irc.mentions_only) {
         this.scheduleAutonomousEvaluation(conversationId, { addressed });
       }
     }
